@@ -1057,6 +1057,19 @@ static bool parseBaseTypeForQualifiedDeclName(Parser &P, TypeRepr *&baseType) {
   // `parseTypeIdentifier(/*isParsingQualifiedDeclName*/ true)` leaves the
   // leading period unparsed to avoid syntax verification errors.
   assert(P.startsWithSymbol(P.Tok, '.') && "false");
+
+  if (P.Tok.is(tok::period)) {
+     const Token &nextToken = P.peekToken();
+     if(nextToken.is(tok::identifier)) {
+        StringRef tokText = nextToken.getText();
+        for(auto accessor : allAccessorKinds()) {
+           if(tokText == getAccessorLabel(accessor)) {
+             return false;
+           }
+        }
+     }
+  }
+
   P.consumeStartingCharacterOfCurrentToken(tok::period);
 
   // Set base type and return false (no error).
@@ -1081,9 +1094,19 @@ static bool parseQualifiedDeclName(Parser &P, Diag<> nameParseError,
                                    DeclNameRefWithLoc &original) {
   SyntaxParsingContext DeclNameContext(P.SyntaxContext,
                                        SyntaxKind::QualifiedDeclName);
+
+  {
+   Parser::BacktrackingScope backtrack(P);
+
   // Parse base type.
   if (parseBaseTypeForQualifiedDeclName(P, baseType))
     return true;
+
+  if(!P.Tok.is(tok::period)) {
+    backtrack.cancelBacktrack();
+  } 
+  }
+  
   // Parse final declaration name.
   original.Name = P.parseDeclNameRef(
       original.Loc, nameParseError,
