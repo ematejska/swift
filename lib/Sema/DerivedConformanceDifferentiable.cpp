@@ -26,6 +26,7 @@
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/Stmt.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
 #include "DerivedConformances.h"
 
@@ -44,7 +45,7 @@ getStoredPropertiesForDifferentiation(NominalTypeDecl *nominal, DeclContext *DC,
     if (auto *originalProperty = vd->getOriginalWrappedProperty()) {
       // Skip immutable wrapped properties. `mutating func move(along:)` cannot
       // be synthesized to update these properties.
-      if (!originalProperty->getAccessor(AccessorKind::Set))
+      if (!originalProperty->isSettable(DC))
         continue;
       // Use the original wrapped property.
       vd = originalProperty;
@@ -646,22 +647,21 @@ getOrSynthesizeTangentVectorStruct(DerivedConformance &derived, Identifier id) {
   structDecl->setImplicit();
   structDecl->copyFormalAccessFrom(nominal, /*sourceIsParentContext*/ true);
 
-  // Add members to `TangentVector` struct.
+  // Add stored properties to the `TangentVector` struct.
   for (auto *member : diffProperties) {
-    // Add this member's corresponding `TangentVector` type to the parent's
-    // `TangentVector` struct.
-    // Note: `newMember` is not marked as implicit here, because that
-    // incorrectly affects memberwise initializer synthesis.
-    auto *newMember = new (C) VarDecl(
+    // Add a tangent stored property to the `TangentVector` struct, with the
+    // name and `TangentVector` type of the original property.
+    auto *tangentProperty = new (C) VarDecl(
         member->isStatic(), member->getIntroducer(), member->isCaptureList(),
         /*NameLoc*/ SourceLoc(), member->getName(), structDecl);
-
+    // Note: `tangentProperty` is not marked as implicit here, because that
+    // incorrectly affects memberwise initializer synthesis.
     auto memberContextualType =
         parentDC->mapTypeIntoContext(member->getValueInterfaceType());
     auto memberTanType =
         getTangentVectorInterfaceType(memberContextualType, parentDC);
-    newMember->setInterfaceType(memberTanType);
-    Pattern *memberPattern = NamedPattern::createImplicit(C, newMember);
+    tangentProperty->setInterfaceType(memberTanType);
+    Pattern *memberPattern = NamedPattern::createImplicit(C, tangentProperty);
     memberPattern->setType(memberTanType);
     memberPattern =
         TypedPattern::createImplicit(C, memberPattern, memberTanType);
@@ -669,16 +669,21 @@ getOrSynthesizeTangentVectorStruct(DerivedConformance &derived, Identifier id) {
     auto *memberBinding = PatternBindingDecl::createImplicit(
         C, StaticSpellingKind::None, memberPattern, /*initExpr*/ nullptr,
         structDecl);
-    structDecl->addMember(newMember);
+    structDecl->addMember(tangentProperty);
     structDecl->addMember(memberBinding);
-    newMember->copyFormalAccessFrom(member, /*sourceIsParentContext*/ true);
-    newMember->setSetterAccess(member->getFormalAccess());
+    tangentProperty->copyFormalAccessFrom(member,
+                                          /*sourceIsParentContext*/ true);
+    tangentProperty->setSetterAccess(member->getFormalAccess());
 
-    // Now that this member is in the `TangentVector` type, it should be marked
-    // `@differentiable` so that the differentiation transform will synthesize
-    // derivative functions for it. We only add this to public stored
-    // properties, because their access outside the module will go through a
-    // call to the getter.
+    // Cache the tangent property.
+    C.evaluator.cacheOutput(TangentStoredPropertyRequest{member},
+                            TangentPropertyInfo(tangentProperty));
+
+    // Now that the original property has a corresponding tangent property, it
+    // should be marked `@differentiable` so that the differentiation transform
+    // will synthesize derivative functions for its accessors. We only add this
+    // to public stored properties, because their access outside the module will
+    // go through accessor declarations.
     if (member->getEffectiveAccess() > AccessLevel::Internal &&
         !member->getAttrs().hasAttribute<DifferentiableAttr>()) {
       auto *getter = member->getSynthesizedAccessor(AccessorKind::Get);
@@ -786,7 +791,7 @@ static void checkAndDiagnoseImplicitNoDerivative(ASTContext &Context,
       // Diagnose wrapped properties whose property wrappers do not define
       // `wrappedValue.set`. `mutating func move(along:)` cannot be synthesized
       // to update these properties.
-      if (!originalProperty->getAccessor(AccessorKind::Set)) {
+      if (!originalProperty->isSettable(DC)) {
         auto *wrapperDecl =
             vd->getInterfaceType()->getNominalOrBoundGenericNominal();
         auto loc =

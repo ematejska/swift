@@ -441,7 +441,7 @@ class RequirementRequest :
     public SimpleRequest<RequirementRequest,
                          Requirement(WhereClauseOwner, unsigned,
                                      TypeResolutionStage),
-                         RequestFlags::SeparatelyCached> {
+                         RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -464,10 +464,8 @@ public:
   // Cycle handling.
   void noteCycleStep(DiagnosticEngine &diags) const;
                            
-  // Separate caching.
+  // Caching.
   bool isCached() const;
-  Optional<Requirement> getCachedResult() const;
-  void cacheResult(Requirement value) const;
 };
 
 /// Generate the USR for the given declaration.
@@ -2187,6 +2185,27 @@ private:
   // Evaluation.
   AbstractFunctionDecl *evaluate(Evaluator &evaluator,
                                  DerivativeAttr *attr) const;
+
+public:
+  // Caching.
+  bool isCached() const { return true; }
+};
+
+/// Resolves the "tangent stored property" corresponding to an original stored
+/// property in a `Differentiable`-conforming type.
+class TangentStoredPropertyRequest
+    : public SimpleRequest<TangentStoredPropertyRequest,
+                           TangentPropertyInfo(VarDecl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  TangentPropertyInfo evaluate(Evaluator &evaluator,
+                               VarDecl *originalField) const;
 
 public:
   // Caching.

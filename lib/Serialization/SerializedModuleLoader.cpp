@@ -959,7 +959,7 @@ SerializedModuleLoaderBase::loadModule(SourceLoc importLoc,
 
   auto M = ModuleDecl::create(moduleID.Item, Ctx);
   M->setIsSystemModule(isSystemModule);
-  Ctx.LoadedModules[moduleID.Item] = M;
+  Ctx.addLoadedModule(M);
   SWIFT_DEFER { M->setHasResolvedImports(); };
 
   StringRef moduleInterfacePathStr =
@@ -1010,7 +1010,7 @@ MemoryBufferSerializedModuleLoader::loadModule(SourceLoc importLoc,
     return nullptr;
 
   M->addFile(*file);
-  Ctx.LoadedModules[moduleID.Item] = M;
+  Ctx.addLoadedModule(M);
   return M;
 }
 
@@ -1087,12 +1087,9 @@ void SerializedASTFile::getImportedModules(
 
 void SerializedASTFile::collectLinkLibrariesFromImports(
     ModuleDecl::LinkLibraryCallback callback) const {
-  ModuleDecl::ImportFilter ImportFilter;
-  ImportFilter |= ModuleDecl::ImportFilterKind::Public;
-  ImportFilter |= ModuleDecl::ImportFilterKind::Private;
-
   llvm::SmallVector<ModuleDecl::ImportedModule, 8> Imports;
-  File.getImportedModules(Imports, ImportFilter);
+  File.getImportedModules(Imports, {ModuleDecl::ImportFilterKind::Public,
+                                    ModuleDecl::ImportFilterKind::Private});
 
   for (auto Import : Imports)
     Import.importedModule->collectLinkLibraries(callback);

@@ -134,6 +134,7 @@ public:
     DumpPCM, ///< Dump information about a precompiled Clang module
 
     ScanDependencies,   ///< Scan dependencies of Swift source files
+    PrintVersion,       ///< Print version information.
   };
 
   /// Indicates the action the user requested that the frontend perform.
@@ -286,9 +287,6 @@ public:
   /// Line and column for each of the locations to be probed by
   /// -dump-scope-maps.
   SmallVector<std::pair<unsigned, unsigned>, 2> DumpScopeMapLocations;
-
-  /// Indicates whether the action will immediately run code.
-  static bool isActionImmediate(ActionType);
 
   /// \return true if action only parses without doing other compilation steps.
   static bool shouldActionOnlyParse(ActionType);

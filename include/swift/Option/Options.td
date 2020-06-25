@@ -213,7 +213,7 @@ def help_hidden : Flag<["-", "--"], "help-hidden">,
 
 def v : Flag<["-"], "v">, Flags<[DoesNotAffectIncrementalBuild]>,
   HelpText<"Show commands to run and use verbose output">;
-def version : Flag<["-", "--"], "version">,
+def version : Flag<["-", "--"], "version">, Flags<[FrontendOption]>,
   HelpText<"Print version information and exit">;
 
 def parseable_output : Flag<["-"], "parseable-output">,
@@ -724,6 +724,9 @@ def gdwarf_types : Flag<["-"], "gdwarf-types">,
 def debug_prefix_map : Separate<["-"], "debug-prefix-map">,
     Flags<[FrontendOption]>,
     HelpText<"Remap source paths in debug info">;
+def coverage_prefix_map : Separate<["-"], "coverage-prefix-map">,
+  Flags<[FrontendOption]>,
+  HelpText<"Remap source paths in coverage info">;
 
 def debug_info_format : Joined<["-"], "debug-info-format=">,
   Flags<[FrontendOption]>,

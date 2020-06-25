@@ -1687,6 +1687,10 @@ public:
   void completeLabeledTrailingClosure(CodeCompletionExpr *E,
                                       bool isAtStartOfLine) override;
 
+  bool canPerformCompleteLabeledTrailingClosure() const override {
+    return true;
+  }
+
   void completeReturnStmt(CodeCompletionExpr *E) override;
   void completeYieldStmt(CodeCompletionExpr *E,
                          Optional<unsigned> yieldIndex) override;
@@ -2081,15 +2085,13 @@ public:
   }
 
   void collectImportedModules(llvm::StringSet<> &ImportedModules) {
-    ModuleDecl::ImportFilter ImportFilter;
-    ImportFilter |= ModuleDecl::ImportFilterKind::Public;
-    ImportFilter |= ModuleDecl::ImportFilterKind::Private;
-    ImportFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
-
     SmallVector<ModuleDecl::ImportedModule, 16> Imported;
     SmallVector<ModuleDecl::ImportedModule, 16> FurtherImported;
-    CurrDeclContext->getParentSourceFile()->getImportedModules(Imported,
-                                                               ImportFilter);
+    CurrDeclContext->getParentSourceFile()->getImportedModules(
+        Imported,
+        {ModuleDecl::ImportFilterKind::Public,
+         ModuleDecl::ImportFilterKind::Private,
+         ModuleDecl::ImportFilterKind::ImplementationOnly});
     while (!Imported.empty()) {
       ModuleDecl *MD = Imported.back().importedModule;
       Imported.pop_back();
@@ -4426,9 +4428,17 @@ public:
     if (AttrKind == DAK_Available) {
       if (ParamIndex == 0) {
         addDeclAttrParamKeyword("*", "Platform", false);
+
+      // For code completion, suggest 'macOS' instead of 'OSX'.
 #define AVAILABILITY_PLATFORM(X, PrettyName)                                  \
+      if (StringRef(#X) == "OSX")                                             \
+        addDeclAttrParamKeyword("macOS", "Platform", false);                  \
+      else if (StringRef(#X) == "OSXApplicationExtension")                    \
+        addDeclAttrParamKeyword("macOSApplicationExtension", "Platform", false); \
+      else                                                                    \
         addDeclAttrParamKeyword(#X, "Platform", false);
 #include "swift/AST/PlatformKinds.def"
+
       } else {
         addDeclAttrParamKeyword("unavailable", "", false);
         addDeclAttrParamKeyword("message", "Specify message", true);
@@ -6148,15 +6158,29 @@ void CodeCompletionCallbacksImpl::doneParsing() {
       if (IsAtStartOfLine) {
         //   foo() {}
         //   <HERE>
-        // Global completion.
+
         auto &Sink = CompletionContext.getResultSink();
-        addDeclKeywords(Sink);
-        addStmtKeywords(Sink, MaybeFuncBody);
-        addSuperKeyword(Sink);
-        addLetVarKeywords(Sink);
-        addExprKeywords(Sink);
-        addAnyTypeKeyword(Sink, CurDeclContext->getASTContext().TheAnyType);
-        DoPostfixExprBeginning();
+        if (isa<Initializer>(CurDeclContext))
+          CurDeclContext = CurDeclContext->getParent();
+
+        if (CurDeclContext->isTypeContext()) {
+          // Override completion (CompletionKind::NominalMemberBeginning).
+          addDeclKeywords(Sink);
+          addLetVarKeywords(Sink);
+          SmallVector<StringRef, 0> ParsedKeywords;
+          CompletionOverrideLookup OverrideLookup(Sink, Context, CurDeclContext,
+                                                  ParsedKeywords, SourceLoc());
+          OverrideLookup.getOverrideCompletions(SourceLoc());
+        } else {
+          // Global completion (CompletionKind::PostfixExprBeginning).
+          addDeclKeywords(Sink);
+          addStmtKeywords(Sink, MaybeFuncBody);
+          addSuperKeyword(Sink);
+          addLetVarKeywords(Sink);
+          addExprKeywords(Sink);
+          addAnyTypeKeyword(Sink, Context.TheAnyType);
+          DoPostfixExprBeginning();
+        }
       } else {
         //   foo() {} <HERE>
         // Member completion.
@@ -6168,15 +6192,33 @@ void CodeCompletionCallbacksImpl::doneParsing() {
         if (analyzedExpr->getEndLoc() != CodeCompleteTokenExpr->getLoc())
           break;
 
-        // If the call expression doesn't have a type, infer it from the
-        // possible callee info.
         Type resultTy = analyzedExpr->getType();
-        if (!resultTy) {
-          if (ContextInfo.getPossibleCallees().empty())
-            break;
-          auto calleeInfo = ContextInfo.getPossibleCallees()[0];
-          resultTy = calleeInfo.Type->getResult();
-          analyzedExpr->setType(resultTy);
+        // If the call expression doesn't have a type, fallback to:
+        if (!resultTy || resultTy->is<ErrorType>()) {
+          // 1) Try to type check removing CodeCompletionExpr from the call.
+          Expr *removedExpr = analyzedExpr;
+          removeCodeCompletionExpr(CurDeclContext->getASTContext(),
+                                   removedExpr);
+          ConcreteDeclRef referencedDecl;
+          auto optT = getTypeOfCompletionContextExpr(
+              CurDeclContext->getASTContext(), CurDeclContext,
+              CompletionTypeCheckKind::Normal, removedExpr, referencedDecl);
+          if (optT) {
+            resultTy = *optT;
+            analyzedExpr->setType(resultTy);
+          }
+        }
+        if (!resultTy || resultTy->is<ErrorType>()) {
+          // 2) Infer it from the possible callee info.
+          if (!ContextInfo.getPossibleCallees().empty()) {
+            auto calleeInfo = ContextInfo.getPossibleCallees()[0];
+            resultTy = calleeInfo.Type->getResult();
+            analyzedExpr->setType(resultTy);
+          }
+        }
+        if (!resultTy || resultTy->is<ErrorType>()) {
+          // 3) Give up providing postfix completions.
+          break;
         }
 
         auto &SM = CurDeclContext->getASTContext().SourceMgr;
@@ -6335,13 +6377,12 @@ void CodeCompletionCallbacksImpl::doneParsing() {
         Lookup.addModuleName(curModule);
 
       // Add results for all imported modules.
-      ModuleDecl::ImportFilter ImportFilter;
-      ImportFilter |= ModuleDecl::ImportFilterKind::Public;
-      ImportFilter |= ModuleDecl::ImportFilterKind::Private;
-      ImportFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
       SmallVector<ModuleDecl::ImportedModule, 4> Imports;
       auto *SF = CurDeclContext->getParentSourceFile();
-      SF->getImportedModules(Imports, ImportFilter);
+      SF->getImportedModules(
+          Imports, {ModuleDecl::ImportFilterKind::Public,
+                    ModuleDecl::ImportFilterKind::Private,
+                    ModuleDecl::ImportFilterKind::ImplementationOnly});
 
       for (auto Imported : Imports) {
         for (auto Import : namelookup::getAllImports(Imported.importedModule))

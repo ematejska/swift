@@ -2488,7 +2488,7 @@ namespace {
       // Make the integer literals for the parameters.
       auto buildExprFromUnsigned = [&](unsigned value) {
         LiteralExpr *expr = IntegerLiteralExpr::createFromUnsigned(ctx, value);
-        cs.setType(expr, TypeChecker::getIntType(ctx));
+        cs.setType(expr, ctx.getIntDecl()->getDeclaredInterfaceType());
         return handleIntegerLiteralExpr(expr);
       };
 
@@ -2533,14 +2533,15 @@ namespace {
       if (cs.getType(expr) && !cs.getType(expr)->hasTypeVariable())
         return expr;
 
-      auto &ctx = cs.getASTContext();
-
       // Figure out the type we're converting to.
       auto openedType = cs.getType(expr);
       auto type = simplifyType(openedType);
       cs.setType(expr, type);
 
-      if (type->is<UnresolvedType>()) return expr;
+      if (type->is<UnresolvedType>())
+        return expr;
+
+      auto &ctx = cs.getASTContext();
 
       Type conformingType = type;
       if (auto baseType = conformingType->getOptionalObjectType()) {
@@ -2550,7 +2551,7 @@ namespace {
       }
 
       // Find the appropriate object literal protocol.
-      auto proto = TypeChecker::getLiteralProtocol(cs.getASTContext(), expr);
+      auto proto = TypeChecker::getLiteralProtocol(ctx, expr);
       assert(proto && "Missing object literal protocol?");
       auto conformance =
         TypeChecker::conformsToProtocol(conformingType, proto, cs.DC);
@@ -2560,9 +2561,24 @@ namespace {
 
       ConcreteDeclRef witness = conformance.getWitnessByName(
           conformingType->getRValueType(), constrName);
-      if (!witness || !isa<AbstractFunctionDecl>(witness.getDecl()))
+
+      auto selectedOverload = solution.getOverloadChoiceIfAvailable(
+          cs.getConstraintLocator(expr, ConstraintLocator::ConstructorMember));
+
+      if (!selectedOverload)
         return nullptr;
+
+      auto fnType =
+          simplifyType(selectedOverload->openedType)->castTo<FunctionType>();
+
+      auto newArg = coerceCallArguments(
+          expr->getArg(), fnType, witness,
+          /*applyExpr=*/nullptr, expr->getArgumentLabels(),
+          expr->hasTrailingClosure(),
+          cs.getConstraintLocator(expr, ConstraintLocator::ApplyArgument));
+
       expr->setInitializer(witness);
+      expr->setArg(newArg);
       return expr;
     }
 
@@ -4698,7 +4714,9 @@ namespace {
                                  StringRef(stringCopy, compatStringBuf.size()),
                                  SourceRange(),
                                  /*implicit*/ true);
-          cs.setType(stringExpr, TypeChecker::getStringType(cs.getASTContext()));
+          cs.setType(
+              stringExpr,
+              cs.getASTContext().getStringDecl()->getDeclaredInterfaceType());
           E->setObjCStringLiteralExpr(stringExpr);
         }
       }

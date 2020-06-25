@@ -1357,22 +1357,21 @@ namespace {
       if (expr->getType())
         return expr->getType();
 
-      auto &de = CS.getASTContext().Diags;
-      auto protocol = TypeChecker::getLiteralProtocol(CS.getASTContext(), expr);
+      auto &ctx = CS.getASTContext();
+      auto &de = ctx.Diags;
+      auto protocol = TypeChecker::getLiteralProtocol(ctx, expr);
       if (!protocol) {
         de.diagnose(expr->getLoc(), diag::use_unknown_object_literal_protocol,
                     expr->getLiteralKindPlainName());
         return nullptr;
       }
 
-      auto tv = CS.createTypeVariable(exprLoc,
-                                      TVO_PrefersSubtypeBinding |
-                                      TVO_CanBindToNoEscape |
-                                      TVO_CanBindToHole);
-      
-      CS.addConstraint(ConstraintKind::LiteralConformsTo, tv,
-                       protocol->getDeclaredType(),
-                       exprLoc);
+      auto witnessType = CS.createTypeVariable(
+          exprLoc, TVO_PrefersSubtypeBinding | TVO_CanBindToNoEscape |
+                       TVO_CanBindToHole);
+
+      CS.addConstraint(ConstraintKind::LiteralConformsTo, witnessType,
+                       protocol->getDeclaredType(), exprLoc);
 
       // The arguments are required to be argument-convertible to the
       // idealized parameter type of the initializer, which generally
@@ -1380,9 +1379,7 @@ namespace {
       // all the redundant stuff about literals (leaving e.g. "red:").
       // Constraint application will quietly rewrite the type of 'args' to
       // use the right labels before forming the call to the initializer.
-      auto constrName =
-          TypeChecker::getObjectLiteralConstructorName(CS.getASTContext(),
-                                                       expr);
+      auto constrName = TypeChecker::getObjectLiteralConstructorName(ctx, expr);
       assert(constrName);
       auto *constr = dyn_cast_or_null<ConstructorDecl>(
           protocol->getSingleRequirement(constrName));
@@ -1390,27 +1387,33 @@ namespace {
         de.diagnose(protocol, diag::object_literal_broken_proto);
         return nullptr;
       }
-      auto constrParamType =
-          TypeChecker::getObjectLiteralParameterType(expr, constr);
 
-      // Extract the arguments.
+      auto *memberLoc =
+          CS.getConstraintLocator(expr, ConstraintLocator::ConstructorMember);
+
+      auto *memberType =
+          CS.createTypeVariable(memberLoc, TVO_CanBindToNoEscape);
+
+      CS.addValueMemberConstraint(MetatypeType::get(witnessType, ctx),
+                                  DeclNameRef(constrName), memberType, CurDC,
+                                  FunctionRefKind::DoubleApply, {}, memberLoc);
+
       SmallVector<AnyFunctionType::Param, 8> args;
       AnyFunctionType::decomposeInput(CS.getType(expr->getArg()), args);
 
-      // Extract the parameters.
-      SmallVector<AnyFunctionType::Param, 8> params;
-      AnyFunctionType::decomposeInput(constrParamType, params);
+      auto resultType = CS.createTypeVariable(
+          CS.getConstraintLocator(expr, ConstraintLocator::FunctionResult),
+          TVO_CanBindToNoEscape);
 
-      auto funcType = constr->getMethodInterfaceType()->castTo<FunctionType>();
-      ::matchCallArguments(
-          CS, funcType, args, params, ConstraintKind::ArgumentConversion,
-          CS.getConstraintLocator(expr, ConstraintLocator::ApplyArgument));
+      CS.addConstraint(
+          ConstraintKind::ApplicableFunction,
+          FunctionType::get(args, resultType), memberType,
+          CS.getConstraintLocator(expr, ConstraintLocator::ApplyFunction));
 
-      Type result = tv;
       if (constr->isFailable())
-        result = OptionalType::get(result);
+        return OptionalType::get(witnessType);
 
-      return result;
+      return witnessType;
     }
 
     Type visitDeclRefExpr(DeclRefExpr *E) {
@@ -1420,7 +1423,7 @@ namespace {
       if (auto *VD = dyn_cast<VarDecl>(E->getDecl())) {
         knownType = CS.getTypeIfAvailable(VD);
         if (!knownType)
-          knownType = VD->getInterfaceType();
+          knownType = VD->getType();
 
         if (knownType) {
           assert(!knownType->isHole());
@@ -1432,8 +1435,6 @@ namespace {
           }
 
           // Set the favored type for this expression to the known type.
-          if (knownType->hasTypeParameter())
-            knownType = VD->getDeclContext()->mapTypeIntoContext(knownType);
           CS.setFavoredType(E, knownType.getPointer());
         }
 
@@ -1446,7 +1447,7 @@ namespace {
         if (auto *PD = dyn_cast<ParamDecl>(VD)) {
           if (!CS.hasType(PD)) {
             if (knownType && knownType->hasUnboundGenericType())
-              knownType = CS.openUnboundGenericType(knownType, locator);
+              knownType = CS.openUnboundGenericTypes(knownType, locator);
 
             CS.setType(
                 PD, knownType ? knownType
@@ -1499,7 +1500,7 @@ namespace {
       options |= TypeResolutionFlags::AllowUnboundGenerics;
       auto result = TypeResolution::forContextual(CS.DC, options)
                         .resolveType(repr);
-      if (!result || result->hasError()) {
+      if (result->hasError()) {
         return Type();
       }
       return result;
@@ -1521,7 +1522,7 @@ namespace {
       if (!type || type->hasError()) return Type();
       
       auto locator = CS.getConstraintLocator(E);
-      type = CS.openUnboundGenericType(type, locator);
+      type = CS.openUnboundGenericTypes(type, locator);
       return MetatypeType::get(type);
     }
 
@@ -2205,7 +2206,7 @@ namespace {
           Type externalType;
           if (param->getTypeRepr()) {
             auto declaredTy = param->getType();
-            externalType = CS.openUnboundGenericType(declaredTy, paramLoc);
+            externalType = CS.openUnboundGenericTypes(declaredTy, paramLoc);
           } else {
             // Let's allow parameters which haven't been explicitly typed
             // to become holes by default, this helps in situations like
@@ -2404,6 +2405,7 @@ namespace {
           }
 
           varType = TypeChecker::getOptionalType(var->getLoc(), varType);
+          assert(!varType->hasError());
 
           if (oneWayVarType) {
             oneWayVarType =
@@ -2439,7 +2441,7 @@ namespace {
         // Look through reference storage types.
         type = type->getReferenceStorageReferent();
 
-        Type openedType = CS.openUnboundGenericType(type, locator);
+        Type openedType = CS.openUnboundGenericTypes(type, locator);
         assert(openedType);
 
         auto *subPattern = cast<TypedPattern>(pattern)->getSubPattern();
@@ -2541,7 +2543,7 @@ namespace {
         if (!castType)
           return Type();
 
-        castType = CS.openUnboundGenericType(
+        castType = CS.openUnboundGenericTypes(
             castType,
             locator.withPathElement(LocatorPathElt::PatternMatch(pattern)));
 
@@ -2607,7 +2609,7 @@ namespace {
           if (!parentType)
             return Type();
 
-          parentType = CS.openUnboundGenericType(
+          parentType = CS.openUnboundGenericTypes(
               parentType, CS.getConstraintLocator(
                               locator, {LocatorPathElt::PatternMatch(pattern),
                                         ConstraintLocator::ParentType}));
@@ -2770,7 +2772,7 @@ namespace {
             Type castType = TypeResolution::forContextual(
                                 CS.DC, TypeResolverContext::InExpression)
                                 .resolveType(isp->getCastTypeRepr());
-            if (!castType) {
+            if (castType->hasError()) {
               return false;
             }
 
@@ -2938,7 +2940,7 @@ namespace {
       // Try to build the appropriate type for a variadic argument list of
       // the fresh element type.  If that failed, just bail out.
       auto array = TypeChecker::getArraySliceType(expr->getLoc(), element);
-      if (!array) return element;
+      if (array->hasError()) return element;
 
       // Require the operand to be convertible to the array type.
       CS.addConstraint(ConstraintKind::Conversion,
@@ -3100,7 +3102,7 @@ namespace {
 
       // Open the type we're casting to.
       const auto toType =
-          CS.openUnboundGenericType(type, CS.getConstraintLocator(expr));
+          CS.openUnboundGenericTypes(type, CS.getConstraintLocator(expr));
       if (repr) CS.setType(repr, toType);
 
       auto fromType = CS.getType(fromExpr);
@@ -3127,7 +3129,7 @@ namespace {
 
       // Open the type we're casting to.
       const auto toType =
-          CS.openUnboundGenericType(type, CS.getConstraintLocator(expr));
+          CS.openUnboundGenericTypes(type, CS.getConstraintLocator(expr));
       if (repr) CS.setType(repr, toType);
 
       auto fromType = CS.getType(expr->getSubExpr());
@@ -3160,7 +3162,7 @@ namespace {
 
       // Open the type we're casting to.
       const auto toType =
-          CS.openUnboundGenericType(type, CS.getConstraintLocator(expr));
+          CS.openUnboundGenericTypes(type, CS.getConstraintLocator(expr));
       if (repr) CS.setType(repr, toType);
 
       auto fromType = CS.getType(fromExpr);
@@ -3189,7 +3191,7 @@ namespace {
       // Open up the type we're checking.
       // FIXME: Locator for the cast type?
       const auto toType =
-          CS.openUnboundGenericType(type, CS.getConstraintLocator(expr));
+          CS.openUnboundGenericTypes(type, CS.getConstraintLocator(expr));
       CS.setType(expr->getCastTypeRepr(), toType);
 
       // Add a checked cast constraint.
@@ -3304,7 +3306,7 @@ namespace {
     /// worth QoI efforts.
     Type getOptionalType(SourceLoc optLoc, Type valueTy) {
       auto optTy = TypeChecker::getOptionalType(optLoc, valueTy);
-      if (!optTy ||
+      if (optTy->hasError() ||
           TypeChecker::requireOptionalIntrinsics(CS.getASTContext(), optLoc))
         return Type();
 
@@ -3469,7 +3471,7 @@ namespace {
             rootRepr, TypeResolverContext::InExpression);
         if (!rootObjectTy || rootObjectTy->hasError())
           return Type();
-        rootObjectTy = CS.openUnboundGenericType(rootObjectTy, locator);
+        rootObjectTy = CS.openUnboundGenericTypes(rootObjectTy, locator);
         // Allow \Derived.property to be inferred as \Base.property to
         // simulate a sort of covariant conversion from
         // KeyPath<Derived, T> to KeyPath<Base, T>.
@@ -4210,26 +4212,35 @@ static Expr *generateConstraintsFor(ConstraintSystem &cs, Expr *expr,
 static Type generateWrappedPropertyTypeConstraints(
    ConstraintSystem &cs, Type initializerType,
    VarDecl *wrappedVar, ConstraintLocator *locator) {
-  Type valueType = LValueType::get(initializerType);
   auto dc = wrappedVar->getInnermostDeclContext();
 
+  Type wrapperType = LValueType::get(initializerType);
+  Type wrappedValueType;
+
   for (unsigned i : indices(wrappedVar->getAttachedPropertyWrappers())) {
+    Type rawWrapperType = wrappedVar->getAttachedPropertyWrapperType(i);
+    if (!rawWrapperType || rawWrapperType->hasError())
+      return Type();
+
+    // The former wrappedValue type must be equal to the current wrapper type
+    if (wrappedValueType) {
+      wrapperType = cs.openUnboundGenericTypes(rawWrapperType, locator);
+      cs.addConstraint(ConstraintKind::Equal, wrappedValueType, wrapperType,
+                       locator);
+    }
+
     auto wrapperInfo = wrappedVar->getAttachedPropertyWrapperTypeInfo(i);
     if (!wrapperInfo)
-      break;
+      return Type();
 
-    locator = cs.getConstraintLocator(locator, ConstraintLocator::Member);
-    Type memberType = cs.createTypeVariable(locator, TVO_CanBindToLValue);
-    cs.addValueMemberConstraint(
-        valueType, wrapperInfo.valueVar->createNameRef(),
-        memberType, dc, FunctionRefKind::Unapplied, { }, locator);
-    valueType = memberType;
+    wrappedValueType = wrapperType->getTypeOfMember(
+        dc->getParentModule(), wrapperInfo.valueVar);
   }
 
   // Set up an equality constraint to drop the lvalue-ness of the value
   // type we produced.
   Type propertyType = cs.createTypeVariable(locator, 0);
-  cs.addConstraint(ConstraintKind::Equal, propertyType, valueType, locator);
+  cs.addConstraint(ConstraintKind::Equal, propertyType, wrappedValueType, locator);
   return propertyType;
 }
 
@@ -4246,10 +4257,13 @@ static bool generateInitPatternConstraints(
   assert(patternType && "All patterns have a type");
 
   if (auto wrappedVar = target.getInitializationWrappedVar()) {
-    // Add an equal constraint between the pattern type and the
-    // property wrapper's "value" type.
     Type propertyType = generateWrappedPropertyTypeConstraints(
         cs, cs.getType(target.getAsExpr()), wrappedVar, locator);
+    if (!propertyType)
+      return true;
+
+    // Add an equal constraint between the pattern type and the
+    // property wrapper's "value" type.
     cs.addConstraint(ConstraintKind::Equal, patternType,
                      propertyType, locator, /*isFavored*/ true);
   } else if (!patternType->is<OpaqueTypeArchetypeType>()) {
